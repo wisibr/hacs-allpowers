@@ -4,6 +4,8 @@ import asyncio
 import logging
 import sys
 from collections.abc import Callable
+from functools import reduce
+from operator import xor
 from typing import Any, TypeVar
 
 from bleak.backends.device import BLEDevice
@@ -33,6 +35,14 @@ _LOGGER.setLevel(logging.WARN)
 
 DEFAULT_ATTEMPTS = sys.maxsize
 
+R2500_V2_NAME = "ap r2500 v2.0"
+R2500_V2_MAIN_HEADER = bytes.fromhex("a5 65 b1 00 01 08 01")
+R2500_V2_SETTINGS_HEADER = bytes.fromhex("a5 65 b1 00 01 06 03")
+R2500_V2_STATUS_REQUEST = bytes.fromhex("a5 65 b1 00 01 06 01 00 00 00 00 00")
+R2500_V2_UPS_SOURCES = {0x0000: "bypass", 0xFFFF: "battery"}
+UPS_STATUS_MAX_AGE = 15
+UPS_STATUS_REQUEST_TIMEOUT = 3
+
 
 class CharacteristicMissingError(Exception):
     """Raised when a characteristic is missing."""
@@ -45,6 +55,8 @@ class AllpowersBLE:
         self,
         ble_device: BLEDevice,
         advertisement_data: AdvertisementData | None = None,
+        *,
+        configured_name: str | None = None,
     ) -> None:
         """Init the Allpowers BLE."""
         self._ble_device = ble_device
@@ -57,7 +69,14 @@ class AllpowersBLE:
         self.loop = asyncio.get_running_loop()
         self._callbacks: list[Callable[[AllpowersState], None]] = []
         self._disconnected_callbacks: list[Callable[[], None]] = []
-        self._buf = b""
+        name = ble_device.name
+        if not name or name.casefold() == ble_device.address.casefold():
+            name = configured_name or ""
+        self.supports_ups_status = name.strip().casefold() == R2500_V2_NAME
+        self._ups_ac_on = False
+        self._ups_ac_at: float | None = None
+        self._ups_source: str | None = None
+        self._ups_source_at: float | None = None
 
     def set_ble_device_and_advertisement_data(
         self, ble_device: BLEDevice, advertisement_data: AdvertisementData
@@ -128,6 +147,46 @@ class AllpowersBLE:
         """Return outgoing power in watts."""
         return self._state.watts_export
 
+    @property
+    def ups_status(self) -> str | None:
+        """Return the UPS state from fresh, confirmed device data."""
+        now = self.loop.time()
+        if self._ups_ac_at is None or now - self._ups_ac_at >= UPS_STATUS_MAX_AGE:
+            return None
+        if not self._ups_ac_on:
+            return "ac_output_off"
+        if self._ups_source_at is None or now - self._ups_source_at >= UPS_STATUS_MAX_AGE:
+            return None
+        return self._ups_source
+
+    async def async_request_ups_status(self) -> None:
+        """Request telemetry from a connected R2500 V2."""
+        if not self.supports_ups_status or self._operation_lock.locked():
+            return
+
+        async with self._operation_lock:
+            client = self._client
+            if client is None or not client.is_connected:
+                return
+
+            try:
+                characteristic = client.services.get_characteristic(CHARACTERISTIC_WRITE)
+                if characteristic is None:
+                    return
+                response = "write" in characteristic.properties
+                if not response and "write-without-response" not in characteristic.properties:
+                    return
+                await asyncio.wait_for(
+                    client.write_gatt_char(
+                        characteristic, R2500_V2_STATUS_REQUEST, response=response
+                    ),
+                    timeout=UPS_STATUS_REQUEST_TIMEOUT,
+                )
+            except (BleakError, asyncio.TimeoutError):
+                _LOGGER.debug(
+                    "%s: Could not request UPS status", self.name, exc_info=True
+                )
+
     async def _change_status_to_device(self) -> None:
         """Send the current state back to the device."""
         full = bytes.fromhex("a56500b10101000071")
@@ -147,8 +206,9 @@ class AllpowersBLE:
         if self.ac_on:
             s[8] = s[8] + 4
 
-        if self._client is not None:
-            await self._client.write_gatt_char(CHARACTERISTIC_WRITE, s)
+        async with self._operation_lock:
+            if self._client is not None:
+                await self._client.write_gatt_char(CHARACTERISTIC_WRITE, s)
 
     async def set_torch(self, enabled: bool) -> None:
         """Set the current value of the light."""
@@ -258,9 +318,28 @@ class AllpowersBLE:
         """Handle notification responses."""
         _LOGGER.debug("%s: Notification received: %s", self.name, data.hex())
 
-        self._buf += data
+        if len(data) <= 14:
+            if (
+                self.supports_ups_status
+                and len(data) == 14
+                and data.startswith(R2500_V2_SETTINGS_HEADER)
+                and reduce(xor, data) == 0
+            ):
+                source = int.from_bytes(data[9:11], "big")
+                self._ups_source = R2500_V2_UPS_SOURCES.get(source)
+                self._ups_source_at = self.loop.time()
+                self._fire_callbacks()
+            return
 
-        if len(data) <= 14: return
+        if (
+            self.supports_ups_status
+            and len(data) == 16
+            and data.startswith(R2500_V2_MAIN_HEADER)
+            and data[8] <= 100
+            and reduce(xor, data) == 0
+        ):
+            self._ups_ac_on = bool(data[7] & 0x02)
+            self._ups_ac_at = self.loop.time()
 
         battery_percentage = data[8]
         dc_on = data[7] >> 0 & 1 == 1
@@ -292,6 +371,8 @@ class AllpowersBLE:
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
+        self._ups_ac_at = None
+        self._ups_source_at = None
         self._fire_disconnected_callbacks()
         if self._expected_disconnect:
             _LOGGER.debug(

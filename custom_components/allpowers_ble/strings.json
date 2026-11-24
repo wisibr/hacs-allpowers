@@ -18,5 +18,17 @@
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
       "no_devices_found": "[%key:common::config_flow::abort::no_devices_found%]"
     }
+  },
+  "entity": {
+    "sensor": {
+      "ups_status": {
+        "name": "UPS Status",
+        "state": {
+          "bypass": "Mains bypass",
+          "battery": "On battery",
+          "ac_output_off": "AC output off"
+        }
+      }
+    }
   }
 }

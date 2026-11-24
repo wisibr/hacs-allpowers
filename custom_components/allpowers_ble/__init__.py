@@ -28,7 +28,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(
             f"Could not find Allpowers BLE battery device with address {address}"
         )
-    allpowers_ble = AllpowersBLE(ble_device)
+    allpowers_ble = AllpowersBLE(ble_device, configured_name=entry.title)
     coordinator = AllpowersBLECoordinator(hass, allpowers_ble)
 
     try:

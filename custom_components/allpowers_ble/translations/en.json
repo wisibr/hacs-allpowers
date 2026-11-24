@@ -18,5 +18,17 @@
                 }
             }
         }
+    },
+    "entity": {
+        "sensor": {
+            "ups_status": {
+                "name": "UPS Status",
+                "state": {
+                    "bypass": "Mains bypass",
+                    "battery": "On battery",
+                    "ac_output_off": "AC output off"
+                }
+            }
+        }
     }
 }

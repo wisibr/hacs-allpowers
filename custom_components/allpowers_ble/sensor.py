@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from homeassistant.components.sensor import (
     SensorDeviceClass,
     SensorEntity,
@@ -11,6 +13,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import AllpowersBLE, AllpowersBLECoordinator
@@ -61,6 +64,18 @@ WATTS_EXPORT_DESCRIPTION = SensorEntityDescription(
     state_class=SensorStateClass.MEASUREMENT,
 )
 
+UPS_STATUS_DESCRIPTION = SensorEntityDescription(
+    key="ups_status",
+    device_class=SensorDeviceClass.ENUM,
+    entity_registry_enabled_default=True,
+    entity_registry_visible_default=True,
+    has_entity_name=True,
+    translation_key="ups_status",
+    options=["bypass", "battery", "ac_output_off"],
+)
+
+UPS_STATUS_POLL_INTERVAL = timedelta(seconds=5)
+
 SENSOR_DESCRIPTIONS = [
     PERCENT_REMAIN_DESCRIPTION,
     MINUTES_REMAIN_DESCRIPTION,
@@ -76,7 +91,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up the platform for Allpowers BLE"""
     data: AllpowersBLEData = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
+    entities = [
         AllpowersBLESensor(
             data.coordinator,
             data.device,
@@ -84,7 +99,14 @@ async def async_setup_entry(
             description,
         )
         for description in SENSOR_DESCRIPTIONS
-    )
+    ]
+    if data.device.supports_ups_status:
+        entities.append(
+            AllpowersBLEUpsStatusSensor(
+                data.coordinator, data.device, entry.title, UPS_STATUS_DESCRIPTION
+            )
+        )
+    async_add_entities(entities)
 
 
 class AllpowersBLESensor(
@@ -135,3 +157,28 @@ class AllpowersBLESensor(
     @property
     def native_value(self) -> str | int | None:
         return getattr(self._device, self._key)
+
+
+class AllpowersBLEUpsStatusSensor(AllpowersBLESensor):
+    """Read-only UPS status with a periodic status request."""
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_track_time_interval(
+                self.hass, self._async_update_ups_status, UPS_STATUS_POLL_INTERVAL
+            )
+        )
+
+    async def _async_update_ups_status(self, _now: datetime) -> None:
+        """Update availability even if the station has stopped sending data."""
+        self.async_write_ha_state()
+        await self._device.async_request_ups_status()
+
+    @property
+    def available(self) -> bool:
+        return self.native_value is not None
+
+    @property
+    def assumed_state(self) -> bool:
+        return False
